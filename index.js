@@ -1,5 +1,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 
 const client = new Client({
     intents: [
@@ -12,8 +14,13 @@ const client = new Client({
     partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-let roleMessageId = null; 
-const channelId = '869410860215468035';
+const channelId = process.env.CHANNEL_ID;
+const roleMessageFile = path.join(__dirname, 'roleMessageId.txt'); // File to save roleMessageId
+let roleMessageId = null;
+
+if (fs.existsSync(roleMessageFile)) {
+    roleMessageId = fs.readFileSync(roleMessageFile, 'utf8').trim();
+}
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
@@ -24,10 +31,26 @@ client.once('ready', async () => {
         return;
     }
 
-    const message = await channel.send("**React with your country flag on this message please**");
-    roleMessageId = message.id;
+    let message;
+    if (roleMessageId) {
+        try {
+            message = await channel.messages.fetch(roleMessageId);
+            console.log('Found existing role message!');
+            await message.fetch();
+                for (const [emoji, reaction] of message.reactions.cache) {
+            await reaction.users.fetch();
+            }
+        } catch (error) {
+            console.error('Old message not found, creating new one.');
+        }
+    }
 
-    console.log('Role selection message sent!');
+    if (!message) {
+        message = await channel.send("**React with your country flag on this message please**");
+        roleMessageId = message.id;
+        fs.writeFileSync(roleMessageFile, roleMessageId);
+        console.log('Role selection message sent and saved!');
+    }
 });
 
 client.on('messageReactionAdd', async (reaction, user) => {
