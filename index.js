@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ChannelType, REST, Routes, SlashCommandBuilder, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -14,83 +14,106 @@ const client = new Client({
     partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-const channelId = process.env.CHANNEL_ID;
-const roleMessageFile = path.join(__dirname, 'roleMessageId.txt'); // File to save roleMessageId
-let roleMessageId = null;
+// Files where server-specific channelId and roleMessageId are stored
+const channelFile = path.join(__dirname, 'channelId.json');
+const roleMessageFile = path.join(__dirname, 'roleMessageId.json');
 
-if (fs.existsSync(roleMessageFile)) {
-    roleMessageId = fs.readFileSync(roleMessageFile, 'utf8').trim();
+// Read server-specific data if it exists
+let serverData = {};
+if (fs.existsSync(channelFile)) {
+    serverData = JSON.parse(fs.readFileSync(channelFile, 'utf8'));
 }
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
 
-    const channel = await client.channels.fetch(channelId);
-    if (!channel) {
-        console.error('Channel not found!');
-        return;
-    }
+    await registerCommands();
+});
 
-    let message;
-    if (roleMessageId) {
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'setup') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: 'You must be an admin to use this command.', ephemeral: true });
+        }
+
+        const targetChannel = interaction.options.getChannel('channel');
+
+        if (targetChannel.type !== ChannelType.GuildText) {
+            return interaction.reply({ content: 'Please select a valid text channel.', ephemeral: true });
+        }
+
+        const guildName = interaction.guild.name;
+
         try {
-            message = await channel.messages.fetch(roleMessageId);
-            console.log('Found existing role message!');
-            await message.fetch();
-                for (const [emoji, reaction] of message.reactions.cache) {
-            await reaction.users.fetch();
-            }
-        } catch (error) {
-            console.error('Old message not found, creating new one.');
+            const message = await targetChannel.send("**React with your country flag on this message please**");
+
+            // Store the channelId and roleMessageId for the specific server
+            serverData[`${guildName}ChannelId`] = targetChannel.id;
+            serverData[`${guildName}RoleMessageId`] = message.id;
+
+            // Save updated server data to the JSON files
+            fs.writeFileSync(channelFile, JSON.stringify(serverData, null, 2));
+            fs.writeFileSync(roleMessageFile, JSON.stringify(serverData, null, 2));
+
+            return interaction.reply({ content: `Setup complete! Message sent to <#${targetChannel.id}> in server "${guildName}".`, ephemeral: true });
+        } catch (err) {
+            console.error(err);
+            return interaction.reply({ content: 'Failed to send message to the selected channel.', ephemeral: true });
         }
     }
-
-    if (!message) {
-        message = await channel.send("**React with your country flag on this message please**");
-        roleMessageId = message.id;
-        fs.writeFileSync(roleMessageFile, roleMessageId);
-        console.log('Role selection message sent and saved!');
-    }
 });
+
+async function registerCommands() {
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('setup')
+            .setDescription('Set up the role selection message.')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('Select the text channel to send the message.')
+                    .setRequired(true))
+            .toJSON()
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+    try {
+        const appId = process.env.APPLICATION_ID;
+        await rest.put(Routes.applicationCommands(appId), { body: commands });
+        console.log('Slash command registered.');
+    } catch (error) {
+        console.error('Failed to register commands:', error);
+    }
+}
 
 client.on('messageReactionAdd', async (reaction, user) => {
     if (reaction.partial) {
         try { await reaction.fetch(); } catch (error) { console.error('Fetching error:', error); return; }
     }
-    if (user.bot) return;
-    if (reaction.message.id !== roleMessageId) return;
+    const guildName = reaction.message.guild.name;
+    if (user.bot || !serverData[`${guildName}RoleMessageId`] || reaction.message.id !== serverData[`${guildName}RoleMessageId`]) return;
 
     const emoji = reaction.emoji.name;
     const countryName = emojiToCountryName(emoji);
-    if (!countryName) {
-        console.log(`Unknown country emoji: ${emoji}`);
-        return;
-    }
+    if (!countryName) return;
 
     const guild = reaction.message.guild;
     const member = await guild.members.fetch(user.id);
-
     let role = guild.roles.cache.find(r => r.name === countryName);
 
     if (!role) {
-        try {
-            role = await guild.roles.create({
-                name: countryName,
-                color: 'Random',
-                reason: `Created automatically for country role selection.`,
-            });
-            console.log(`Created new role: ${countryName}`);
-        } catch (err) {
-            console.error(`Failed to create role ${countryName}:`, err);
-            return;
-        }
+        role = await guild.roles.create({
+            name: countryName,
+            color: null,
+            permissions: [],
+            reason: 'Country role for reaction'
+        }).catch(console.error);
     }
 
-    try {
-        await member.roles.add(role);
-        console.log(`Assigned role ${countryName} to ${user.tag}`);
-    } catch (err) {
-        console.error(`Failed to assign role: ${err}`);
+    if (role) {
+        await member.roles.add(role).catch(console.error);
     }
 });
 
@@ -98,29 +121,20 @@ client.on('messageReactionRemove', async (reaction, user) => {
     if (reaction.partial) {
         try { await reaction.fetch(); } catch (error) { console.error('Fetching error:', error); return; }
     }
-    if (user.bot) return;
-    if (reaction.message.id !== roleMessageId) return;
+    const guildName = reaction.message.guild.name;
+    if (user.bot || !serverData[`${guildName}RoleMessageId`] || reaction.message.id !== serverData[`${guildName}RoleMessageId`]) return;
 
     const emoji = reaction.emoji.name;
     const countryName = emojiToCountryName(emoji);
-    if (!countryName) {
-        console.log(`Unknown country emoji: ${emoji}`);
-        return;
-    }
+    if (!countryName) return;
 
     const guild = reaction.message.guild;
     const member = await guild.members.fetch(user.id);
     const role = guild.roles.cache.find(r => r.name === countryName);
-    if (!role) return;
-
-    try {
-        await member.roles.remove(role);
-        console.log(`Removed role ${countryName} from ${user.tag}`);
-    } catch (err) {
-        console.error(`Failed to remove role: ${err}`);
+    if (role) {
+        await member.roles.remove(role).catch(console.error);
     }
 });
-
 function emojiToCountryName(emoji) {
     const map = {
     "🇦🇫": "Afghanistan",
